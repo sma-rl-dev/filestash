@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1.7
+#
+# Filestash tester-env image, built from this checkout (never from an upstream
+# image). Upstream's docker/Dockerfile git-clones master and installs
+# libvips/heif/av headers so the CGO vips image plugin compiles; this file takes
+# the project's own CI path instead (Jenkinsfile): swap plg_image_c for the pure
+# Go plg_image_golang, build CGO-free with --tags fts5. No C toolchain, no
+# external service, one static binary.
+ARG GO_IMAGE=golang:1.26-trixie
+
+# The two console plugins embed xterm 3.12.2, which upstream's `make init`
+# downloads with `go generate`. Generator output is gitignored, so it must be
+# produced at build time. This stage only depends on go.mod and the generator
+# dirs, so the download layer is reused for every source edit.
+FROM ${GO_IMAGE} AS generate
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY server/pkg/mime/ server/pkg/mime/
+COPY server/plugin/plg_handler_console/ server/plugin/plg_handler_console/
+COPY server/plugin/plg_widget_console/ server/plugin/plg_widget_console/
+RUN --mount=type=cache,target=/go/pkg/mod \
+    cd server/pkg/mime && go run generator.go && \
+    cd /src/server/plugin/plg_handler_console && go run generator.go && \
+    cd /src/server/plugin/plg_widget_console && go run generator.go
+
+FROM ${GO_IMAGE} AS build
+WORKDIR /src
+ENV CGO_ENABLED=0
+COPY --from=generate /src/server/pkg/mime/mime_generated.go server/pkg/mime/
+COPY --from=generate /src/server/plugin/plg_handler_console/src/ server/plugin/plg_handler_console/src/
+COPY --from=generate /src/server/plugin/plg_widget_console/assets/ server/plugin/plg_widget_console/assets/
+COPY go.mod go.sum ./
+# Dependency layer: cloud SDKs, git, ldap, nfs, pty and sqlite (modernc) make
+# this the expensive layer, so it is keyed on go.mod/go.sum alone and cached
+# in /go/pkg/mod across rebuilds. Only changed packages recompile afterwards.
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+# server/pkg/env's generator shells out to `git rev-parse HEAD`; the .git dir is
+# not in the build context (see .dockerignore) and BUILD_REF[0:7] panics on an
+# empty value, so the pinned SHA is injected here instead.
+ARG BUILD_REF=0000000000000000000000000000000000000000
+ARG BUILD_DATE=20260101
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    sed -i 's|plg_image_c|plg_image_golang|' server/plugin/index.go && \
+    printf 'package env\n\nvar (\n\tBUILD_REF = "%s"\n\tBUILD_DATE = "%s"\n)\n' \
+      "$BUILD_REF" "$BUILD_DATE" > server/pkg/env/constants_generated.go && \
+    go build -trimpath -buildvcs=false --tags fts5 -o /out/filestash cmd/main.go
+
+FROM alpine:3.22
+# ffmpeg/poppler-utils are deliberately absent: only media previews and office
+# round-trips need them, and scenarios do not assert on thumbnails.
+RUN adduser -D -u 1000 filestash && apk add --no-cache ca-certificates
+WORKDIR /app
+COPY --from=build /out/filestash /app/filestash
+# FILESTASH_PATH is the one writable tree (state/config, state/db, state/search,
+# state/log, cache) and also holds the seeded local-backend drive, so the single
+# volume mounted here is the whole reset unit. The directory is baked into the
+# image so a fresh named volume inherits it with the right ownership.
+ENV FILESTASH_PATH=/app/filestash-data \
+    FILESTASH_PORT=8334 \
+    DEBUG=false
+RUN mkdir -p /app/filestash-data/drive && \
+    chown -R filestash:filestash /app/filestash-data && \
+    chmod 730 /app/filestash
+USER filestash
+EXPOSE 8334
+HEALTHCHECK --interval=5s --timeout=3s --start-period=20s --retries=24 \
+    CMD wget -q -O /dev/null http://127.0.0.1:8334/healthz || exit 1
+CMD ["/app/filestash"]

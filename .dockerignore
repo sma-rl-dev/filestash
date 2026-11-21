@@ -1,0 +1,6 @@
+.git
+dist
+data
+node_modules
+public/node_modules
+.work

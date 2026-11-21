@@ -1,0 +1,4 @@
+invoice,client,issued,amount_eur,status
+INV-2026-041,Harbor Health,2026-07-01,4800,paid
+INV-2026-042,Kestrel Retail,2026-07-15,1250,paid
+INV-2026-043,Northwind Studio,2026-08-01,2100,open

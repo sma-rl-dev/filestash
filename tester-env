@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Filestash - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>] [--origin <url>]
+# Commands: build, start, deploy, seed, verify, stop, reset, logs, status, url, help
+
+RUN_ID="default"
+PORT="18650"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Baseline pinned by triage (status/apps/filestash.toml): master tip, because the
+# project ships no GitHub Releases and its only tags (v0.0-v0.4) date from 2019.
+BASELINE_REF="b6fe63f4f01eecbada100d567a84c2503de8fbee"
+# server/pkg/env's BUILD_REF is rendered into /assets/<ref>/ URLs and sliced
+# [0:7], so it must be non-empty; BUILD_DATE only surfaces in banners/user-agent.
+BUILD_DATE="20260101"
+
+# Deterministic admin password: config.Initialise() copies $ADMIN_PASSWORD into
+# auth.admin and both /admin and the built-in `local` storage backend
+# bcrypt-compare that stored value. The stored value must therefore be a bcrypt
+# HASH, not the plaintext: upstream's setup wizard hashes client-side
+# (public/assets/pages/adminpage/ctrl_setup.js) and ADMIN_PASSWORD is written
+# verbatim. This fixed hash (cost 10, salt frozen) keeps reset deterministic;
+# the plaintext below is what the browser and curl log in with.
+ADMIN_PASSWORD="FilestashAdmin!2026"
+ADMIN_PASSWORD_HASH='$2a$10$4NOAiBv85opHkXYAcp5CQudQhDo57VxfRzgjFYyYNx8DBuN2zUiYa'
+
+# Deterministic admin-visible config written by `seed` (same config round-trip
+# as the admin screens): the site name is document.title on every page
+# (public/assets/boot/ctrl_boot_frontoffice.js) and the connection label is the
+# tab the connect page shows for this storage.
+APP_NAME="Meridian Analytics"
+CONNECTION_LABEL="Meridian Drive"
+
+# The whole state tree is one volume; the local backend is pointed at the seeded
+# drive inside it, so reset (container + volume) is a single unit.
+DATA_VOLUME_BASE="filestash-data"
+DRIVE_PATH="/app/filestash-data/drive"
+SEED_DRIVE="${SCRIPT_DIR}/seed/drive"
+# Pinned mtimes live next to (not inside) the drive, so they never show up in the UI.
+SEED_MTIMES="${SCRIPT_DIR}/seed/mtimes.txt"
+
+# DEBUG=true makes the server serve ./public from disk (embed.go) instead of the
+# compiled-in copy, so a frontend mutant needs a container restart, not a Go
+# build. The mount is read-only; set DEBUG=false to exercise the embed.
+DEBUG="${DEBUG:-true}"
+
+# Canonical origin written to general.host. EMPTY BY DEFAULT on purpose:
+#   - SecureOrigin blocks every non-/admin request whose Host differs from
+#     general.host, and the frontoffice AS A WHOLE redirects the browser to
+#     general.host when the hostname differs
+#     (public/assets/boot/ctrl_boot_frontoffice.js verify_origin).
+#   - The same stack must answer http://172.16.0.1:<port>/ and
+#     http://host.docker.internal:<port>/, and a Chromium container cannot
+#     resolve host.docker.internal, so no single value is safe.
+# With general.host empty both checks are skipped (config.go frontend Origin ""
+# and middleware/http.go `if host != ""`), so any Host header works with no
+# redirect. Set --origin/FILESTASH_ORIGIN only when absolute links must be
+# pinned, and expect the other hostnames to be redirected to it.
+# general.host is a bare host[:port] (`http://` is added elsewhere, and passing a
+# URL produced "http://http://host:port" in /api/config), so the scheme is
+# stripped here.
+APP_ORIGIN="${FILESTASH_ORIGIN:-}"
+APP_HOST=""
+
+export DOCKER_BUILDKIT=1
+
+refresh_names() {
+    local suffix="" sanitized
+    if [[ "${RUN_ID}" != "default" ]]; then
+        sanitized="$(printf '%s' "${RUN_ID}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-')"
+        suffix="-${sanitized}"
+    fi
+
+    CONTAINER_NAME="tester-env-filestash${suffix}"
+    DATA_VOLUME="${DATA_VOLUME_BASE}${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-filestash:dev}"
+}
+
+require_running() {
+    if [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || true)" != "true" ]]; then
+        echo "Error: container ${CONTAINER_NAME} is not running. Run './tester-env deploy' first." >&2
+        exit 1
+    fi
+}
+
+wait_for_health() {
+    local attempt
+    for attempt in $(seq 1 120); do
+        if curl -sf "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then
+            echo "==> App healthy after ${attempt}s"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "Error: app did not become healthy at http://127.0.0.1:${PORT}/" >&2
+    docker logs --tail 60 "${CONTAINER_NAME}" >&2 || true
+    exit 1
+}
+
+# Canonical origin the running container enforces (general.host). Empty means
+# no enforcement at all: SecureOrigin skips the Host check and the frontoffice
+# JS has no origin to redirect to.
+applied_origin() {
+    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${CONTAINER_NAME}" 2>/dev/null \
+        | sed -n 's/^APPLICATION_URL=//p'
+}
+
+# A browser container cannot use localhost: it must dial the host through the
+# bridge gateway (TESTER_ENV_BROWSER_ORIGIN under scripts/rl-env).
+default_browser_origin() {
+    local gw
+    gw="$(docker network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)"
+    printf 'http://%s:%s' "${gw:-127.0.0.1}" "${PORT}"
+}
+
+# Origin to hand to a browser: what the app enforces when pinned, otherwise the
+# requested/derived browser origin.
+browser_origin() {
+    local applied
+    applied="$(applied_origin)"
+    printf '%s' "${applied:-${BASE_URL}}"
+}
+
+api() {
+    # api METHOD PATH [JSON_BODY] [BEARER_TOKEN]
+    local method="$1" path="$2" body="${3:-}" token="${4:-}" origin
+    local args=(-sS --max-time 30 -X "${method}"
+        -H 'Accept: application/json'
+        -H 'X-Requested-With: XmlHttpRequest')
+    origin="$(applied_origin)"
+    [[ -n "${origin}" ]] && args+=(-H "Host: ${origin#*://}")
+    [[ -n "${token}" ]] && args+=(-H "Authorization: Bearer ${token}")
+    if [[ -n "${body}" ]]; then
+        args+=(-H 'Content-Type: application/json' -d "${body}")
+    fi
+    curl "${args[@]}" "http://127.0.0.1:${PORT}${path}"
+}
+
+admin_login() {
+    local body resp
+    body="$(jq -n --arg password "${ADMIN_PASSWORD}" '{password: $password}')"
+    # The handler deliberately sleeps 1.5s before comparing the bcrypt hash.
+    resp="$(api POST /admin/api/session "${body}")" || return 1
+    jq -r '.result.access_token // empty' <<<"${resp}" 2>/dev/null || true
+}
+
+backend_login() {
+    local body resp
+    body="$(jq -n --arg password "${ADMIN_PASSWORD}" --arg path "${DRIVE_PATH}" \
+        '{type: "local", password: $password, path: $path}')"
+    api POST /api/session "${body}"
+}
+
+list_drive() {
+    # list_drive TOKEN [PATH] -> ls payload
+    local origin
+    origin="$(applied_origin)"
+    local args=(-sS --max-time 30 -G
+        -H 'Accept: application/json'
+        -H 'X-Requested-With: XmlHttpRequest'
+        -H "Authorization: Bearer $1")
+    [[ -n "${origin}" ]] && args+=(-H "Host: ${origin#*://}")
+    curl "${args[@]}" \
+        --data-urlencode "path=${2:-/}" \
+        "http://127.0.0.1:${PORT}/api/files/ls"
+}
+
+seed_ts_for() {
+    # seed_ts_for RELPATH -> mtime as epoch milliseconds, from seed/mtimes.txt
+    local iso
+    iso="$(awk -v p="$1" '$1 !~ /^#/ && $2 == p { print $1; exit }' "${SEED_MTIMES}")"
+    [[ -n "${iso}" ]] || return 1
+    printf '%s000' "$(date -u -d "${iso}" +%s)"
+}
+
+seed_drive() {
+    # Reset the drive to the committed fixture tree and hand it to the app user
+    # so the browser can also rename/upload/delete there. The drive belongs to
+    # the seed: leftovers from a previous run (a folder created in the UI, an
+    # upload) are removed first, so seed is repeatable without a full reset.
+    if [[ ! -d "${SEED_DRIVE}" || ! -f "${SEED_MTIMES}" ]]; then
+        echo "Error: seed fixtures missing at ${SEED_DRIVE}." >&2
+        exit 1
+    fi
+    local missing
+    missing="$({ find "${SEED_DRIVE}" -mindepth 1 \( -type f -o -type d \) -printf '%P\n'; } | sort \
+        | comm -23 - <(awk 'NF && $1 !~ /^#/ { print $2 }' "${SEED_MTIMES}" | sort))"
+    if [[ -n "${missing}" ]]; then
+        echo "Error: no seed/mtimes.txt entry for: ${missing}" >&2
+        exit 1
+    fi
+    docker exec -u 0 "${CONTAINER_NAME}" mkdir -p "${DRIVE_PATH}"
+    docker exec -u 0 "${CONTAINER_NAME}" find "${DRIVE_PATH}" -mindepth 1 -delete
+    docker cp "${SEED_DRIVE}/." "${CONTAINER_NAME}:${DRIVE_PATH}/"
+    # Pin mtimes in manifest order (files then directories) so listings do not
+    # depend on checkout time. BusyBox touch -t is CCYYMMDDhhmm.ss in UTC.
+    local iso rel
+    while read -r iso rel; do
+        [[ -z "${iso}" || "${iso}" == \#* ]] && continue
+        docker exec -u 0 "${CONTAINER_NAME}" touch -t \
+            "$(date -u -d "${iso}" +%Y%m%d%H%M.%S)" "${DRIVE_PATH}/${rel}"
+    done < "${SEED_MTIMES}"
+    docker exec -u 0 "${CONTAINER_NAME}" chown -R filestash:filestash "${DRIVE_PATH}"
+}
+
+cmd_build() {
+    echo "==> Building image ${IMAGE_NAME} from ${BASELINE_REF:0:12} (CGO-free, --tags fts5)..."
+    docker build \
+        --build-arg BUILD_REF="${BASELINE_REF}" \
+        --build-arg BUILD_DATE="${BUILD_DATE}" \
+        -f "${SCRIPT_DIR}/Dockerfile.tester-env" \
+        -t "${IMAGE_NAME}" \
+        "${SCRIPT_DIR}"
+}
+
+cmd_start() {
+    local -a mounts=() app_env=()
+    if [[ "${DEBUG}" == "true" && -d "${SCRIPT_DIR}/public" ]]; then
+        mounts+=(-v "${SCRIPT_DIR}/public:/app/public:ro")
+    fi
+    # Only pin general.host when an origin was requested; the app otherwise
+    # accepts any Host (see APP_ORIGIN above).
+    [[ -n "${APP_HOST}" ]] && app_env+=(-e "APPLICATION_URL=${APP_HOST}")
+
+    echo "==> Recreating container ${CONTAINER_NAME} on port ${PORT}..."
+    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker volume create \
+        --label tester-env.project=tester-env \
+        --label tester-env.app=filestash \
+        --label "tester-env.run-id=${RUN_ID}" \
+        "${DATA_VOLUME}" >/dev/null
+
+    docker run -d --name "${CONTAINER_NAME}" \
+        --label tester-env.project=tester-env \
+        --label tester-env.app=filestash \
+        --label "tester-env.run-id=${RUN_ID}" \
+        -p "${PORT}:8334" \
+        -v "${DATA_VOLUME}:/app/filestash-data" \
+        "${mounts[@]}" \
+        -e "ADMIN_PASSWORD=${ADMIN_PASSWORD_HASH}" \
+        "${app_env[@]}" \
+        -e "DEBUG=${DEBUG}" \
+        -e "FILESTASH_PORT=8334" \
+        -e "TZ=UTC" \
+        "${IMAGE_NAME}" >/dev/null
+
+    wait_for_health
+}
+
+cmd_deploy() {
+    cmd_build
+    cmd_start
+    cmd_seed
+    echo "==> Deployment complete."
+    echo "    URL:      http://localhost:${PORT}/"
+    echo "    Browser:  $(browser_origin)/"
+    echo "    Admin:    http://localhost:${PORT}/admin/ (${ADMIN_PASSWORD})"
+    echo "    Drive:    local backend, password ${ADMIN_PASSWORD}, path ${DRIVE_PATH}"
+}
+
+configure_app() {
+    # Three config values drive the seeded UI:
+    #   - connections: the connect page lists admin-configured entries
+    #     (/api/config), and /api/session refuses a direct login for a backend
+    #     that is not listed (session.isDirectAuthAllowed + files.NewBackend),
+    #     so the one `local` entry must exist. Its label is the connect tab.
+    #   - general.name: rendered as document.title on every page.
+    #   - general.host: when set, SecureOrigin blocks non-/admin requests from
+    #     any other Host and the frontoffice JS redirects the browser to it
+    #     (ctrl_boot_frontoffice.js verify_origin). It is written explicitly
+    #     (empty unless --origin was given) so a stale value from an earlier
+    #     boot cannot pin the stack to an unreachable hostname.
+    local token cfg body resp
+    token="$(admin_login)" || {
+        echo "Error: admin login failed while configuring the app." >&2
+        exit 1
+    }
+    # The admin config endpoint round-trips the serialised form tree, while the
+    # config file stores flat scalars, so unwrap each element's value.
+    cfg="$(api GET /admin/api/config "" "${token}" | jq '.result')"
+    body="$(jq --arg origin "${APP_HOST}" --arg name "${APP_NAME}" --arg conn "${CONNECTION_LABEL}" \
+        'to_entries
+        | map(select(.key != "constant"))
+        | from_entries
+        | map_values(map_values(.value))
+        | .general.host = $origin
+        | .general.name = $name
+        | .connections = [{"type": "local", "label": $conn}]' <<<"${cfg}")"
+    resp="$(api POST /admin/api/config "${body}" "${token}")"
+    if [[ "$(jq -r '.status // empty' <<<"${resp}")" != "ok" ]]; then
+        echo "Error: saving connections/general.host failed: ${resp}" >&2
+        exit 1
+    fi
+}
+
+cmd_seed() {
+    require_running
+    echo "==> Resetting ${DRIVE_PATH} to the deterministic fixture tree..."
+    seed_drive
+    configure_app
+    echo "==> Seed complete: $(find "${SEED_DRIVE}" -type f | wc -l | tr -d ' ') files, $(find "${SEED_DRIVE}" -mindepth 1 -type d | wc -l | tr -d ' ') directories, site '${APP_NAME}', connection '${CONNECTION_LABEL}', origin '${APP_HOST:-any}'."
+}
+
+VERIFY_FAILURES=0
+
+expect() {
+    # expect LABEL EXPECTED ACTUAL
+    if [[ "$2" == "$3" ]]; then
+        echo "    ok: $1"
+        return 0
+    fi
+    echo "    FAIL: $1 (expected '$2', got '$3')" >&2
+    VERIFY_FAILURES=$((VERIFY_FAILURES + 1))
+}
+
+cmd_verify() {
+    require_running
+    echo "==> Verifying build, admin login, local backend and seeded drive..."
+
+    local health about admin_token config_status backend resp status token home
+    health="$(curl -sf "http://127.0.0.1:${PORT}/healthz" || true)"
+    expect "healthz status" "pass" "$(jq -r '.status // empty' <<<"${health}" 2>/dev/null || true)"
+
+    about="$(curl -sf "http://127.0.0.1:${PORT}/about" || true)"
+    expect "about page served" "yes" "$([[ -n "${about}" ]] && echo yes || echo no)"
+
+    admin_token="$(admin_login || true)"
+    expect "admin login returns token" "yes" "$([[ -n "${admin_token}" ]] && echo yes || echo no)"
+    if [[ -z "${admin_token}" ]]; then
+        echo "Error: admin login failed for the pinned ADMIN_PASSWORD." >&2
+        exit 1
+    fi
+
+    config_status="$(api GET /admin/api/config "" "${admin_token}" | jq -r '.status // empty')"
+    expect "admin config readable with token" "ok" "${config_status}"
+
+    # The connect page lists every registered driver; `local` is always imported.
+    backend="$(api GET /api/backend)"
+    expect "local backend listed" "local" \
+        "$(jq -r 'if .result.local then "local" else "missing" end' <<<"${backend}")"
+    expect "local login form has password+path" "true" \
+        "$(jq -r '(.result.local.password != null and .result.local.path != null)' <<<"${backend}")"
+    expect "local connection configured" "true" \
+        "$(api GET /api/config | jq -r 'any(.result.connections[]?; .type == "local")')"
+    expect "site name" "${APP_NAME}" \
+        "$(api GET /api/config | jq -r '.result.name // empty')"
+    expect "connection label" "${CONNECTION_LABEL}" \
+        "$(api GET /api/config | jq -r '.result.connections[0].label // empty')"
+
+    # A wrong admin password must be refused, or the login check above proves nothing.
+    expect "wrong admin password refused" "error" \
+        "$(api POST /admin/api/session "$(jq -n '{password: "not-the-password"}')" | jq -r '.status // empty')"
+
+    resp="$(backend_login)"
+    status="$(jq -r '.status // empty' <<<"${resp}")"
+    expect "local backend login" "ok" "${status}"
+    token="$(jq -r '.result.authorization // empty' <<<"${resp}")"
+    # GetHome reports the backend home relative to the selected root: the local
+    # backend's home is the container user's $HOME, which is outside the chosen
+    # path, so the app answers "/". The drive listing below is the real check.
+    home="$(jq -r '.result.home // empty' <<<"${resp}")"
+    expect "local backend home" "/" "${home}"
+    if [[ -z "${token}" ]]; then
+        echo "Error: local backend login for ${DRIVE_PATH} failed: ${resp}" >&2
+        exit 1
+    fi
+
+    # Every seeded directory must list exactly the fixture entries (so a folder
+    # left behind in the UI fails verification), with the pinned file sizes and
+    # mtimes -- that is what makes sort-by-name/size/date assertions stable.
+    local rel dir_abs listing
+    while IFS= read -r rel; do
+        dir_abs="${SEED_DRIVE}${rel:+/${rel}}"
+        listing="$(list_drive "${token}" "/${rel}")"
+        expect "drive /${rel} entries" \
+            "$(find "${dir_abs}" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" \
+            "$(jq -r '.results[]?.name' <<<"${listing}" | sort)"
+        expect "drive /${rel} file sizes and mtimes" \
+            "$(cd "${dir_abs}" && while IFS= read -r f; do
+                printf '%s %s %s\n' "${f}" "$(stat -c %s "${f}")" "$(seed_ts_for "${rel:+${rel}/}${f}")"
+            done < <(find . -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort))" \
+            "$(jq -r '.results[]? | select(.type == "file") | "\(.name) \(.size) \(.time)"' <<<"${listing}" | sort)"
+    done < <(printf '%s\n' ""; find "${SEED_DRIVE}" -mindepth 1 -type d -printf '%P\n' | sort)
+
+    expect "files page served" "yes" \
+        "$([[ -n "$(curl -sf "http://127.0.0.1:${PORT}/" || true)" ]] && echo yes || echo no)"
+
+    # Origin contract: with no pinned general.host the frontoffice JS has no
+    # redirect target and SecureOrigin accepts every Host, so the same stack is
+    # usable from http://172.16.0.1:<port>/ and http://host.docker.internal:<port>/
+    # (a Chromium container cannot resolve the latter, which is why this must
+    # not be pinned by default).
+    if [[ -z "$(applied_origin)" ]]; then
+        expect "no origin redirect configured" "" \
+            "$(api GET /api/config | jq -r '.result.origin // empty')"
+        local foreign body_foreign code_foreign
+        body_foreign="$(jq -n --arg password "${ADMIN_PASSWORD}" --arg path "${DRIVE_PATH}" \
+            '{type: "local", password: $password, path: $path}')"
+        code_foreign="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Accept: application/json' -H 'Content-Type: application/json' \
+            -H 'X-Requested-With: XmlHttpRequest' -H 'Host: 172.16.0.1:18650' \
+            -d "${body_foreign}" "http://127.0.0.1:${PORT}/api/session")"
+        expect "local login from a foreign Host" "200" "${code_foreign}"
+    fi
+
+    if [[ "${VERIFY_FAILURES}" -ne 0 ]]; then
+        echo "Error: ${VERIFY_FAILURES} verification check(s) failed." >&2
+        exit 1
+    fi
+    echo "==> Verify passed."
+}
+
+cmd_stop() {
+    echo "==> Stopping container (data volume preserved)..."
+    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+}
+
+cmd_reset() {
+    echo "==> Resetting environment (container + data volume)..."
+    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    # The image is shared with other in-flight runs (content-addressed tag);
+    # only the container and the run's own volume are removed here.
+    if docker volume inspect "${DATA_VOLUME}" >/dev/null 2>&1; then
+        docker volume rm "${DATA_VOLUME}" >/dev/null
+    fi
+    echo "==> Reset complete. Run './tester-env deploy' to start fresh."
+}
+
+cmd_logs() {
+    docker logs -f --tail 100 "${CONTAINER_NAME}" "$@"
+}
+
+cmd_status() {
+    if [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null || true)" == "true" ]]; then
+        local pinned
+        pinned="$(applied_origin)"
+        # Report the origin the app actually enforces, and say so when it
+        # enforces none (then every Host works and nothing redirects).
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}/"
+        echo "Browser URL: $(browser_origin)/"
+        echo "Pinned origin: ${pinned:-none (any Host accepted, no redirect)}"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Image: ${IMAGE_NAME}"
+        echo "Volume: ${DATA_VOLUME}"
+        echo "Admin: http://localhost:${PORT}/admin/ (password ${ADMIN_PASSWORD})"
+        echo "Drive: ${DRIVE_PATH} (local backend, password ${ADMIN_PASSWORD})"
+        echo "Assets: $([[ "${DEBUG}" == "true" ]] && echo "public/ served from the mounted host tree (DEBUG=true)" || echo "embedded in the binary (DEBUG=false)")"
+    else
+        echo "Status: NOT RUNNING"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Image: ${IMAGE_NAME}"
+    fi
+}
+
+cmd_url() {
+    echo "http://localhost:${PORT}/"
+    echo "browser: $(browser_origin)/"
+}
+
+cmd_help() {
+    cat <<EOF
+Filestash - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>] [--origin <url>]
+
+Commands:
+  build     Build the image from this checkout (CGO-free, --tags fts5)
+  start     Recreate the container on the current image and wait for /healthz
+  deploy    build + start + seed the deterministic drive
+  seed      Reset the drive to the fixture tree, pin its mtimes, write the seeded config
+  verify    Assert /healthz, /about, admin login, local backend login, drive listings
+  stop      Stop the container (data volume preserved)
+  reset     Remove the container and the data volume (image kept)
+  logs      Follow container logs
+  status    Show whether the app is running, on which port, with which assets
+  url       Print the host URL and the browser-visible URL
+  help      Show this help
+
+Options:
+  --run-id <id>   Isolate container/volume for parallel runs. Default: default
+  --port <port>   Host port to bind to container port 8334. Default: 18650
+  --origin <url>  Pin general.host (bare host:port stored; scheme stripped).
+
+Typical workflow:
+  ./tester-env deploy    # Build, start, seed the drive
+  ./tester-env verify    # Check health, admin login, local backend, listings
+  ./tester-env reset     # Clean slate
+
+Deployment details:
+  - Baseline: ${BASELINE_REF} (master tip; the project has no GitHub Releases
+    and its only tags end at v0.4, 2019-11-19).
+  - Dockerfile.tester-env follows the project's own CI: plg_image_c is swapped
+    for plg_image_golang and the binary is built CGO_ENABLED=0 with --tags fts5,
+    so there is no libvips/heif/av toolchain and no external service. ffmpeg and
+    poppler-utils are absent: media/office previews are out of scope.
+  - Go dependencies are cached in /go/pkg/mod and the Go build cache in
+    /root/.cache/go-build, so a source edit only recompiles changed packages.
+  - public/ is served from the mounted host tree while DEBUG=true (default), so
+    a frontend edit needs './tester-env start', not a rebuild. DEBUG=false
+    exercises the copy embedded in the binary.
+  - One volume holds FILESTASH_PATH (state/config, state/db, state/search,
+    state/log, cache) and the seeded drive, so reset is one volume removal.
+  - Deterministic auth: ADMIN_PASSWORD carries a fixed bcrypt hash of the pinned
+    admin password on boot, because both /admin and the built-in `local` storage
+    backend bcrypt-compare the stored value (a plaintext env value would never
+    match). No first-run wizard.
+  - No canonical origin is pinned by default: general.host stays empty, so
+    SecureOrigin accepts any Host and the frontoffice JS has nothing to
+    redirect to. That is required on this host because the Chromium container
+    cannot resolve host.docker.internal, while a plain host curl/runner uses
+    localhost. Pass --origin http://<host>:<port> to pin absolute links
+    (general.host is stored without the scheme) and accept that other
+    hostnames then redirect to it.
+  - The `local` backend exposes the whole container filesystem; only
+    ${DRIVE_PATH} is seeded and in scope. Seed owns that directory: it is
+    emptied and recopied from seed/drive on every `seed`, and its entry mtimes
+    are pinned from seed/mtimes.txt, so listings do not depend on checkout time.
+  - Seed also writes deterministic admin config: general.name "${APP_NAME}"
+    (document.title) and one `local` connection labelled "${CONNECTION_LABEL}".
+  - log.telemetry and features.server.console_enable keep their defaults (false).
+
+Environment:
+  IMAGE_TAG                    Content-addressed image tag exported by scripts/rl-env
+  TESTER_ENV_BROWSER_ORIGIN    Origin reported as the browser URL (not enforced)
+  FILESTASH_ORIGIN             Same as --origin
+  DEBUG                        Serve public/ from disk when true. Default: true
+  PORT                         Host port (same as --port)
+
+Caveats:
+  - general.secret_key and the stored admin bcrypt hash are random per state
+    dir: assert behaviour, never cookies or config bytes.
+  - Seed fixtures keep their contents and pinned mtimes; anything the tester
+    creates in the drive is dropped by `seed` (and by `reset`).
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id)
+                RUN_ID="${2:?--run-id requires a value}"
+                shift 2
+                ;;
+            --port)
+                PORT="${2:?--port requires a value}"
+                shift 2
+                ;;
+            --origin)
+                APP_ORIGIN="${2:?--origin requires a value}"
+                shift 2
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+    # Origin to hand to a browser (reporting only) and the optional pinned
+    # general.host. Resolved after --port parsing so the fallback uses the real
+    # port. APP_HOST stays empty unless --origin/FILESTASH_ORIGIN is given.
+    BASE_URL="${BASE_URL:-${TESTER_ENV_BROWSER_ORIGIN:-$(default_browser_origin)}}"
+    APP_HOST="${APP_ORIGIN#*://}"
+
+    case "${cmd}" in
+        build) cmd_build ;;
+        start|up) cmd_start ;;
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        stop) cmd_stop ;;
+        reset|down) cmd_reset ;;
+        logs) cmd_logs ;;
+        status|ps) cmd_status ;;
+        url) cmd_url ;;
+        help|-h|--help) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}" >&2
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,23 @@
+# Fixed mtimes for the seeded drive: "<ISO8601 UTC> <path relative to drive root>".
+# `tester-env seed` applies them with `touch -t` inside the container, so listings
+# do not depend on checkout time. Files first, directories after: touching a child
+# bumps its parent, so directory rows must be seen last. Every seeded file and
+# directory must appear here; seed fails on an unlisted entry.
+2026-02-11T08:30:00Z Shared-Drive-Guide.md
+2026-10-02T14:05:00Z Brand/palette.json
+2026-10-02T14:10:00Z Brand/logo-mark.png
+2026-01-06T09:00:00Z Contracts/harbor-health-retainer.md
+2026-08-27T16:45:00Z Contracts/kestrel-retail-loyalty-cohort-sow.md
+2025-12-18T11:20:00Z Contracts/archive/2025/harbor-health-retainer-2025.md
+2026-08-04T10:15:00Z Finance/2026-q3-invoices.csv
+2026-09-30T07:40:00Z Finance/budgets/2026-opex-budget.csv
+2026-03-16T12:00:00Z Team/onboarding-notes.txt
+2026-09-12T15:25:00Z Team/headshots/avery-chen.png
+2026-10-02T14:10:00Z Brand
+2026-08-27T16:45:00Z Contracts
+2025-12-18T11:20:00Z Contracts/archive
+2025-12-18T11:20:00Z Contracts/archive/2025
+2026-09-30T07:40:00Z Finance
+2026-09-30T07:40:00Z Finance/budgets
+2026-09-12T15:25:00Z Team
+2026-09-12T15:25:00Z Team/headshots

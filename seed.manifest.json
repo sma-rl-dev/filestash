@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "app": "filestash",
+  "seed_profile": "default",
+  "requirements": {
+    "seed-drive-baseline-tree": {
+      "status": "present",
+      "evidence": "tester-env seed empties /app/filestash-data/drive and copies seed/drive, so the local backend shows exactly five root entries (Brand/, Contracts/, Finance/, Team/, Shared-Drive-Guide.md) plus the nested dirs Contracts/archive/2025, Finance/budgets and Team/headshots. cmd_verify compares every directory's entry names against the fixture tree, so a UI-created folder or upload fails verification."
+    },
+    "seed-stable-file-metadata": {
+      "status": "present",
+      "evidence": "seed/mtimes.txt pins a fixed UTC mtime per seeded file and directory (2025-12-18 to 2026-10-02) and seed applies them with touch -t in the container; the 10 files also have 10 distinct sizes (134-454 bytes). cmd_verify asserts each file's size and mtime in milliseconds from /api/files/ls, so name/size/date sorts are stable across resets."
+    },
+    "seed-mixed-file-formats": {
+      "status": "present",
+      "evidence": "Seed provides markdown (Contracts/harbor-health-retainer.md, Contracts/kestrel-retail-loyalty-cohort-sow.md, Contracts/archive/2025/harbor-health-retainer-2025.md, Shared-Drive-Guide.md), CSV (Finance/2026-q3-invoices.csv, Finance/budgets/2026-opex-budget.csv), JSON (Brand/palette.json), plain text (Team/onboarding-notes.txt) and two 96x96 PNG images (Brand/logo-mark.png, Team/headshots/avery-chen.png) served as image/png by /api/files/cat."
+    },
+    "seed-branded-instance-config": {
+      "status": "present",
+      "evidence": "tester-env seed writes general.name \"Meridian Analytics\" (rendered as document.title) and one local connection labelled \"Meridian Drive\" through the same /admin/api/config round-trip the admin screens use; cmd_verify asserts both via /api/config."
+    }
+  }
+}

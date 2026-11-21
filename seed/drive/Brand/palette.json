@@ -1,0 +1,14 @@
+{
+  "name": "Meridian",
+  "updated": "2026-10-02",
+  "colors": {
+    "ink": "#1B2A41",
+    "paper": "#F4F1EA",
+    "signal": "#E4572E",
+    "mint": "#3FA98F"
+  },
+  "typography": {
+    "heading": "Inter Tight",
+    "body": "Source Serif 4"
+  }
+}
